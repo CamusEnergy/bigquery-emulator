@@ -169,6 +169,11 @@ func (r *Repository) Query(ctx context.Context, tx *connection.Tx, projectID, da
 		zap.Any("values", values),
 	)
 	rows, err := tx.Tx().QueryContext(ctx, query, values...)
+	logger.Logger(ctx).Info(
+		"QueryContext",
+		zap.Error(err),
+		zap.Any("rows", rows),
+	)
 	if err != nil {
 		return nil, err
 	}

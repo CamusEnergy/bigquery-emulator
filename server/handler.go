@@ -1521,6 +1521,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 	defer tx.RollbackIfNotCommitted()
 	hasDestinationTable := job.Configuration.Query.DestinationTable != nil
 	startTime := time.Now()
+	logger.Logger(ctx).Info("Query!")
 	response, jobErr := r.server.contentRepo.Query(
 		ctx,
 		tx,
@@ -1533,6 +1534,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 	if job.JobReference.JobId == "" {
 		job.JobReference.JobId = randomID() // generate job id
 	}
+	logger.Logger(ctx).Info("Query", zap.Error(jobErr))
 	if jobErr == nil {
 		if hasDestinationTable {
 			// insert results to destination table
