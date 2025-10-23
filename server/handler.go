@@ -410,6 +410,17 @@ func (h *uploadContentHandler) Handle(ctx context.Context, r *uploadContentReque
 	load := r.job.Content().Configuration.Load
 	tableRef := load.DestinationTable
 	dataset := r.project.Dataset(tableRef.DatasetId)
+
+	conn, err := r.server.connMgr.Connection(ctx, tableRef.ProjectId, tableRef.DatasetId)
+	if err != nil {
+		return fmt.Errorf("failed to get connection: %w", err)
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackIfNotCommitted()
+
 	table := dataset.Table(tableRef.TableId)
 	if table == nil {
 		if load.CreateDisposition == "CREATE_NEVER" {
@@ -427,6 +438,12 @@ func (h *uploadContentHandler) Handle(ctx context.Context, r *uploadContentReque
 			return err
 		}
 		table = dataset.Table(tableRef.TableId)
+	} else {
+		if load.WriteDisposition == "WRITE_TRUNCATE" {
+			if err := r.server.contentRepo.TruncateTable(ctx, tx, tableRef.ProjectId, tableRef.DatasetId, tableRef); err != nil {
+				return fmt.Errorf("failed to truncate table: %w", err)
+			}
+		}
 	}
 
 	tableContent, err := table.Content()
@@ -542,15 +559,6 @@ func (h *uploadContentHandler) Handle(ctx context.Context, r *uploadContentReque
 		Columns: columns,
 		Data:    data,
 	}
-	conn, err := r.server.connMgr.Connection(ctx, tableRef.ProjectId, tableRef.DatasetId)
-	if err != nil {
-		return fmt.Errorf("failed to get connection: %w", err)
-	}
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.RollbackIfNotCommitted()
 	if err := r.server.contentRepo.AddTableData(ctx, tx, tableRef.ProjectId, tableRef.DatasetId, tableDef); err != nil {
 		return err
 	}
@@ -1376,7 +1384,7 @@ func (h *jobsInsertHandler) exportToGCSWithObject(ctx context.Context, response 
 	return nil
 }
 
-func (h *jobsInsertHandler) copyFromBigQuery(ctx context.Context, r *jobsInsertRequest, srcTable *bigqueryv2.TableReference, dstTable *bigqueryv2.TableReference) (*bigqueryv2.Job, error) {
+func (h *jobsInsertHandler) copyFromBigQuery(ctx context.Context, r *jobsInsertRequest, srcTable *bigqueryv2.TableReference, dstTable *bigqueryv2.TableReference, writeDisposition string) (*bigqueryv2.Job, error) {
 	tmpf, err := os.CreateTemp("", "*.jsonl")
 	if err != nil {
 		return nil, fmt.Errorf("failed to set up temporary file: %w", err)
@@ -1442,6 +1450,7 @@ func (h *jobsInsertHandler) copyFromBigQuery(ctx context.Context, r *jobsInsertR
 				DestinationTable:  dstTable,
 				Schema:            response.Schema,
 				SourceFormat:      "NEWLINE_DELIMITED_JSON",
+				WriteDisposition:  writeDisposition,
 			},
 		},
 	}
@@ -1505,7 +1514,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 				return nil, fmt.Errorf("cannot copy without a valid destination table")
 			}
 
-			return h.copyFromBigQuery(ctx, r, sourceTable, copyConfig.DestinationTable)
+			return h.copyFromBigQuery(ctx, r, sourceTable, copyConfig.DestinationTable, copyConfig.WriteDisposition)
 		}
 
 		return nil, fmt.Errorf("unspecified job configuration query")
