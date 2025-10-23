@@ -358,6 +358,28 @@ func (r *Repository) CreateOrReplaceTable(ctx context.Context, tx *connection.Tx
 	return nil
 }
 
+func (r *Repository) TruncateTable(ctx context.Context, tx *connection.Tx, projectID, datasetID string, table *bigqueryv2.TableReference) error {
+	tx.SetProjectAndDataset(projectID, datasetID)
+
+	if err := tx.ContentRepoMode(); err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.MetadataRepoMode()
+	}()
+
+	ddl := fmt.Sprintf(
+		"DELETE FROM `%s` WHERE TRUE",
+		r.tablePath(projectID, datasetID, table.TableId),
+	)
+	if _, err := tx.Tx().ExecContext(ctx, ddl); err != nil {
+		return fmt.Errorf("failed to execute DDL %s: %w", ddl, err)
+	}
+
+	return nil
+}
+
+
 func (r *Repository) AddTableData(ctx context.Context, tx *connection.Tx, projectID, datasetID string, table *types.Table) error {
 	if len(table.Data) == 0 {
 		return nil
