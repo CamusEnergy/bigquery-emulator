@@ -1384,7 +1384,10 @@ func (h *jobsInsertHandler) exportToGCSWithObject(ctx context.Context, response 
 	return nil
 }
 
-func (h *jobsInsertHandler) copyFromBigQuery(ctx context.Context, r *jobsInsertRequest, srcTable *bigqueryv2.TableReference, dstTable *bigqueryv2.TableReference, writeDisposition string) (*bigqueryv2.Job, error) {
+func (h *jobsInsertHandler) copyFromBigQuery(ctx context.Context, r *jobsInsertRequest, srcTable *bigqueryv2.TableReference) (*bigqueryv2.Job, error) {
+	job := r.job
+	startTime := time.Now()
+
 	tmpf, err := os.CreateTemp("", "*.jsonl")
 	if err != nil {
 		return nil, fmt.Errorf("failed to set up temporary file: %w", err)
@@ -1394,10 +1397,12 @@ func (h *jobsInsertHandler) copyFromBigQuery(ctx context.Context, r *jobsInsertR
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
 	}
+
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start transaction: %w", err)
 	}
+	defer tx.RollbackIfNotCommitted()
 
 	response, err := r.server.contentRepo.Query(
 		ctx,
@@ -1445,12 +1450,13 @@ func (h *jobsInsertHandler) copyFromBigQuery(ctx context.Context, r *jobsInsertR
 	// otherwise)
 	loadJob := &bigqueryv2.Job{
 		Configuration: &bigqueryv2.JobConfiguration{
+			DryRun: job.Configuration.DryRun,
 			Load: &bigqueryv2.JobConfigurationLoad{
-				CreateDisposition: "CREATE_IF_NEEDED",
-				DestinationTable:  dstTable,
+				CreateDisposition: job.Configuration.Copy.CreateDisposition,
+				DestinationTable:  job.Configuration.Copy.DestinationTable,
 				Schema:            response.Schema,
 				SourceFormat:      "NEWLINE_DELIMITED_JSON",
-				WriteDisposition:  writeDisposition,
+				WriteDisposition:  job.Configuration.Copy.WriteDisposition,
 			},
 		},
 	}
@@ -1474,7 +1480,63 @@ func (h *jobsInsertHandler) copyFromBigQuery(ctx context.Context, r *jobsInsertR
 		return nil, fmt.Errorf("failed to import results from source: %w", err)
 	}
 
-	return r.job, err
+	job.Kind = "bigquery#job"
+	job.Configuration.JobType = "COPY"
+	job.SelfLink = fmt.Sprintf(
+		"http://%s/bigquery/v2/projects/%s/jobs/%s",
+		r.server.httpServer.Addr,
+		r.project.ID,
+		job.JobReference.JobId,
+	)
+	job.Status = &bigqueryv2.JobStatus{State: "DONE"}
+	job.Statistics = &bigqueryv2.JobStatistics{
+		CreationTime: startTime.UnixMilli(),
+		StartTime:    startTime.UnixMilli(),
+		EndTime:      time.Now().UnixMilli(),
+	}
+
+	// Not great!
+	//
+	// We need a transaction in order to persist our job information.
+	// Unfortunately the transaction that we were using above got closed
+	// (if it stayed open it would conflict with the upload handler) so now
+	// we have to create a new one. Even worse, committing the transaction
+	// closes the connection so we need a new one of those too.
+	//
+	// I think this is still presenting correct behavior to the user because
+	// if the upload handler failed, we'd report it.
+	conn, err = r.server.connMgr.Connection(ctx, r.project.ID, "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get connection: %w", err)
+	}
+
+	tx, err = conn.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start transaction: %w", err)
+	}
+	defer tx.RollbackIfNotCommitted()
+
+	if err := r.project.AddJob(
+		ctx,
+		tx.Tx(),
+		metadata.NewJob(
+			r.server.metaRepo,
+			r.project.ID,
+			job.JobReference.JobId,
+			job,
+			nil,
+			nil,
+		),
+	); err != nil {
+		return nil, fmt.Errorf("failed to add job: %w", err)
+	}
+	if !job.Configuration.DryRun {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("failed to commit job: %w", err)
+		}
+	}
+
+	return job, nil
 }
 
 func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*bigqueryv2.Job, error) {
@@ -1514,7 +1576,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 				return nil, fmt.Errorf("cannot copy without a valid destination table")
 			}
 
-			return h.copyFromBigQuery(ctx, r, sourceTable, copyConfig.DestinationTable, copyConfig.WriteDisposition)
+			return h.copyFromBigQuery(ctx, r, sourceTable)
 		}
 
 		return nil, fmt.Errorf("unspecified job configuration query")
